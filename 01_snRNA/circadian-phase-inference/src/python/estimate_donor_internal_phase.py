@@ -1,0 +1,339 @@
+"""Estimate donor internal phase from sample-level phase inference results."""
+
+import argparse
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+def log(message, verbose=False):
+    if verbose:
+        print(message)
+
+
+def get_sample_column(df):
+    for candidate in ["Sample", "ID", "Sample_ID"]:
+        if candidate in df.columns:
+            return candidate
+    raise ValueError("Fit_Output file must contain one of: Sample, ID, Sample_ID.")
+
+
+def get_phase_column(df):
+    for candidate in ["Phase_MA", "Phases_MA", "Phase", "Predicted_Phase_Hours"]:
+        if candidate in df.columns:
+            return candidate
+    raise ValueError(
+        "Fit_Output file must contain one of: Phase_MA, Phases_MA, Phase, Predicted_Phase_Hours."
+    )
+
+
+def phase_series_to_radians(series, phase_col):
+    values = pd.to_numeric(series, errors="coerce")
+    if phase_col == "Predicted_Phase_Hours":
+        return (values % 24.0) * (2 * np.pi / 24.0)
+    return values % (2 * np.pi)
+
+
+def circular_mean(phases):
+    if len(phases) == 0:
+        return np.nan
+    sin_sum = np.sum(np.sin(phases))
+    cos_sum = np.sum(np.cos(phases))
+    mean_phase = np.arctan2(sin_sum, cos_sum)
+    if mean_phase < 0:
+        mean_phase += 2 * np.pi
+    return mean_phase
+
+def circular_std(phases):
+    if len(phases) == 0:
+        return np.nan
+    sin_sum = np.sum(np.sin(phases))
+    cos_sum = np.sum(np.cos(phases))
+    R = np.sqrt(sin_sum**2 + cos_sum**2) / len(phases)
+    if R < 1e-10:
+        return np.pi
+    return np.sqrt(-2 * np.log(R))
+
+def circular_distance(phase1, phase2):
+    diff = np.abs(phase1 - phase2)
+    return np.minimum(diff, 2*np.pi - diff)
+
+def calculate_dip_with_outlier_removal(donor_data, outlier_threshold=np.pi/2):
+    """Estimate donor phase after removing cell-type phases far from the mean.
+
+    The donor-level phase is initialized with the circular mean across all
+    available sample-level phases. Cell types with phase values farther than
+    the threshold are iteratively removed, which helps stabilize the donor
+    summary when one cell type is strongly discordant with the remainder.
+    """
+
+    phases = donor_data['Phase'].values
+    celltypes = donor_data['CellType'].values
+    
+    if len(phases) == 0:
+        return np.nan, [], []
+    
+    current_dip = circular_mean(phases)
+    included_mask = np.ones(len(phases), dtype=bool)
+    
+    max_iterations = 5
+    for iteration in range(max_iterations):
+        distances = np.array([circular_distance(p, current_dip) for p in phases])
+        
+        outliers = (distances > outlier_threshold) & included_mask
+        
+        if not np.any(outliers):
+            break
+        
+        included_mask = included_mask & ~outliers
+        
+        if np.sum(included_mask) > 0:
+            current_dip = circular_mean(phases[included_mask])
+        else:
+            break
+    
+    included_celltypes = celltypes[included_mask].tolist()
+    excluded_celltypes = celltypes[~included_mask].tolist()
+    
+    return current_dip, included_celltypes, excluded_celltypes
+
+def load_and_process_data(result_dir, verbose=False):
+    """Load inferred phases and parse donor, treatment, and cell-type labels."""
+
+    result_path = Path(result_dir)
+
+    phase_files = sorted(result_path.glob("Fit_Output*.csv"))
+    if not phase_files:
+        raise FileNotFoundError(
+            "No Fit_Output*.csv file was found in the provided results directory."
+        )
+
+    phase_file = phase_files[-1]
+    df = pd.read_csv(phase_file)
+
+    sample_col = get_sample_column(df)
+    phase_col = get_phase_column(df)
+
+    df['Sample'] = df[sample_col].astype(str)
+    df['Phase'] = phase_series_to_radians(df[phase_col], phase_col)
+    log(f"Using {phase_col} from {phase_file.name}", verbose)
+    
+    df = df[df['Phase'].notna()].copy()
+    
+    # The final manuscript datasets use sample identifiers that encode donor,
+    # treatment group, and cell type in the sample name.
+    df['Donor'] = df['Sample'].str.extract(r'^(P\d+)_')[0]
+    df['Treatment'] = df['Sample'].str.extract(r'_(Pre|Post)\.')[0]
+    df['CellType'] = df['Sample'].str.extract(r'\.(.*?)$')[0]
+    
+    # Support an alternative donor naming convention used in some external
+    # datasets where donor IDs begin with CID.
+    cid_mask = df['Donor'].isna()
+    if cid_mask.any():
+        log(
+            f"Found {cid_mask.sum()} samples in GSE176078 format (CID\\d+.CellType)",
+            verbose,
+        )
+        df.loc[cid_mask, 'Donor'] = df.loc[cid_mask, 'Sample'].str.extract(r'^(CID\d+)\.')[0]
+        df.loc[cid_mask, 'Treatment'] = 'All'  # No treatment groups in GSE176078
+        # CellType already extracted above
+    
+    df = df.dropna(subset=['Donor', 'CellType'])
+    
+    return df
+
+def calculate_all_dips(df, remove_outliers=True, outlier_threshold=np.pi/2):
+    """Summarize donor-level phase for each donor and optional treatment group."""
+
+    results = []
+    
+    has_treatment = df['Treatment'].nunique() > 1
+    
+    for donor in sorted(df['Donor'].unique()):
+        donor_data = df[df['Donor'] == donor].copy()
+        
+        if remove_outliers:
+            dip, included, excluded = calculate_dip_with_outlier_removal(
+                donor_data, outlier_threshold
+            )
+        else:
+            dip = circular_mean(donor_data['Phase'].values)
+            included = donor_data['CellType'].tolist()
+            excluded = []
+        
+        dip_std = circular_std(donor_data['Phase'].values)
+        n_samples = len(donor_data)
+        n_included = len(included)
+        n_excluded = len(excluded)
+        
+        results.append({
+            'Donor': donor,
+            'DIP': dip,
+            'DIP_std': dip_std,
+            'N_samples': n_samples,
+            'N_included': n_included,
+            'N_excluded': n_excluded,
+            'Included_celltypes': ','.join(included) if included else '',
+            'Excluded_celltypes': ','.join(excluded) if excluded else ''
+        })
+        
+        # Only process treatment groups if they exist
+        if has_treatment:
+            for treatment in sorted(donor_data['Treatment'].unique()):
+                treat_data = donor_data[donor_data['Treatment'] == treatment]
+                
+                if remove_outliers:
+                    dip_treat, incl, excl = calculate_dip_with_outlier_removal(
+                        treat_data, outlier_threshold
+                    )
+                else:
+                    dip_treat = circular_mean(treat_data['Phase'].values)
+                    incl = treat_data['CellType'].tolist()
+                    excl = []
+                
+                dip_treat_std = circular_std(treat_data['Phase'].values)
+                
+                results.append({
+                    'Donor': f"{donor}_{treatment}",
+                    'DIP': dip_treat,
+                    'DIP_std': dip_treat_std,
+                    'N_samples': len(treat_data),
+                    'N_included': len(incl),
+                    'N_excluded': len(excl),
+                    'Included_celltypes': ','.join(incl) if incl else '',
+                    'Excluded_celltypes': ','.join(excl) if excl else ''
+                })
+    
+    return pd.DataFrame(results)
+
+def plot_dip_results(df, dip_df, output_dir, verbose=False):
+    """Generate histogram, scatter, and circular summary plots for DIP."""
+
+    donors = [d for d in dip_df['Donor'].values if '_' not in d]
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    ax = axes[0]
+    dip_values = dip_df[dip_df['Donor'].isin(donors)]['DIP'].values
+    
+    dip_hours = dip_values * 24 / (2 * np.pi)
+    
+    ax.hist(dip_hours, bins=20, alpha=0.7, color='steelblue', edgecolor='black')
+    ax.set_xlabel('DIP (hours)', fontsize=12)
+    ax.set_ylabel('Count', fontsize=12)
+    ax.set_title(f'Distribution of Donor Internal Phase (n={len(donors)})', 
+                 fontsize=14, fontweight='bold')
+    ax.set_xlim([0, 24])
+    ax.grid(True, alpha=0.3)
+    
+    ax = axes[1]
+    
+    for donor in donors[:10]:
+        donor_data = df[df['Donor'] == donor]
+        dip = dip_df[dip_df['Donor'] == donor]['DIP'].values[0]
+        
+        tips = donor_data['Phase'].values * 24 / (2 * np.pi)
+        dip_h = dip * 24 / (2 * np.pi)
+        
+        ax.scatter([donor] * len(tips), tips, alpha=0.5, s=50)
+        ax.scatter([donor], [dip_h], color='red', marker='*', s=200, 
+                  edgecolors='black', linewidths=1.5, zorder=10)
+    
+    ax.set_xlabel('Donor', fontsize=12)
+    ax.set_ylabel('Phase (hours)', fontsize=12)
+    ax.set_title('TIP (dots) vs DIP (red stars)', fontsize=14, fontweight='bold')
+    ax.set_ylim([0, 24])
+    ax.grid(True, alpha=0.3, axis='y')
+    plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    
+    plt.tight_layout()
+    output_file = Path(output_dir) / 'DIP_summary.png'
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    log(f"Saved: {output_file}", verbose)
+    plt.close()
+    
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='polar')
+    
+    dip_df_donors = dip_df[dip_df['Donor'].isin(donors)]
+    
+    for _, row in dip_df_donors.iterrows():
+        dip = row['DIP']
+        std = row['DIP_std']
+        
+        ax.scatter(dip, 1, s=100, alpha=0.6, edgecolors='black', linewidths=1)
+        
+        if not np.isnan(std):
+            arc = np.linspace(dip - std, dip + std, 20)
+            ax.plot(arc, [1]*len(arc), linewidth=3, alpha=0.3)
+    
+    ax.set_ylim([0, 1.2])
+    ax.set_theta_zero_location('N')
+    ax.set_theta_direction(-1)
+    
+    hour_labels = [f'{int(h)}h' for h in np.linspace(0, 24, 13)[:-1]]
+    ax.set_xticklabels(hour_labels)
+    ax.set_yticks([])
+    
+    ax.set_title(f'Donor Internal Phase Distribution (n={len(donors)})', 
+                 fontsize=14, fontweight='bold', pad=20)
+    
+    plt.tight_layout()
+    output_file = Path(output_dir) / 'DIP_circular.png'
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    log(f"Saved: {output_file}", verbose)
+    plt.close()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Estimate donor internal phase from a results directory."
+    )
+    parser.add_argument(
+        "results_path",
+        help="Directory containing Fit_Output*.csv produced by phase inference.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print additional dataset-level parsing and progress details.",
+    )
+    args = parser.parse_args()
+
+    result_dir = args.results_path
+    verbose = args.verbose
+
+    log(f"Loading data from: {result_dir}", verbose)
+    df = load_and_process_data(result_dir, verbose=verbose)
+    log(
+        (
+            f"Loaded {len(df)} samples; donors={df['Donor'].nunique()}, "
+            f"cell_types={df['CellType'].nunique()}, treatments={df['Treatment'].nunique()}"
+        ),
+        verbose,
+    )
+
+    dip_df = calculate_all_dips(df, remove_outliers=True, outlier_threshold=np.pi/2)
+    
+    output_file = Path(result_dir) / 'DIP_results.csv'
+    dip_df.to_csv(output_file, index=False)
+    plot_dip_results(df, dip_df, result_dir, verbose=verbose)
+
+    donor_only = dip_df[~dip_df['Donor'].str.contains('_')].copy()
+    donor_only['DIP_hours'] = donor_only['DIP'] * 24 / (2 * np.pi)
+    donor_only['DIP_std_hours'] = donor_only['DIP_std'] * 24 / (2 * np.pi)
+
+    print(f"Saved DIP results to: {output_file}")
+    print(f"Generated: {Path(result_dir) / 'DIP_summary.png'}")
+    print(f"Generated: {Path(result_dir) / 'DIP_circular.png'}")
+
+    if verbose and donor_only['N_excluded'].sum() > 0:
+        print("Excluded cell types (outliers):")
+        for _, row in donor_only.iterrows():
+            if row['Excluded_celltypes']:
+                print(f"{row['Donor']}: {row['Excluded_celltypes']}")
+
+
+if __name__ == "__main__":
+    main()

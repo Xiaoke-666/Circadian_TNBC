@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.julia/
+results/
+.env
+.venv/
+venv/
+*.log
