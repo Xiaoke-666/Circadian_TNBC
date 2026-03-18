@@ -21,7 +21,7 @@ The workflow consists of two main steps:
 - An output directory from InferCNV. More details for outfiles can be found: https://github.com/broadinstitute/inferCNV/wiki/Output-Files
 
 ### How to Run
-Use the code in `01_Run_infercnv.R` and modify the parameters based on the guidance from InfeCNV (https://github.com/broadinstitute/inferCNV/wiki/Running-InferCNV). 
+- Use the code in `01_Run_infercnv.R` and modify the parameters based on the guidance from InfeCNV (https://github.com/broadinstitute/inferCNV/wiki/Running-InferCNV). 
 
 ---
 
@@ -29,7 +29,7 @@ Use the code in `01_Run_infercnv.R` and modify the parameters based on the guida
 
 ### Input
 - InferCNV output (`run.final.infercnv_obj.rds`)
-- A `Seurat` object contains UMAP embeddings which will be used for plottin (`.rds`). 
+- A `Seurat` object contains UMAP embeddings which will be used for plotting (`.rds`). 
 
 ### Output
 - Calculated InferCNV score for each cell (`.csv`)
