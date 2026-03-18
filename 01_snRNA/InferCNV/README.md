@@ -48,8 +48,7 @@ chmod +x 02_Infercnv_score.R
 ```
 
 
-## Notes
-
-- Ensure all input files are properly formatted and consistent across steps.
-- The pipeline assumes prior computation of ChromVar deviation scores and circadian statistics.
-- File paths can be adjusted as needed for your environment.
+## Dependencies
+Before running the script, make sure to install the following R packages:
+- InferCNV: used for InferCNV analysis
+- Seurat: Handles single-cell RNA-seq data for InferCNV 
