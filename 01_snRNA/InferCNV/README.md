@@ -1,6 +1,6 @@
 # Run inferCNV and calculate CNV score
 
-This pipeline runs [InferCNV] (https://github.com/broadinstitute/inferCNV/wiki) and calculate the CNV score based on its output
+This pipeline runs [InferCNV](https://github.com/broadinstitute/inferCNV/wiki) and calculate the CNV score based on its output
 
 ## Overview
 
